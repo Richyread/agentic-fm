@@ -529,6 +529,18 @@ def _walk_layout_json(obj, source_name, to_map, refs):
                     "field", canonical, context,
                 ))
 
+        # Value-list reference. A field placement formatted as a drop-down /
+        # pop-up / checkbox set carries the value list name in `valueList`.
+        # `layout_to_summary.py` captures it but it was never turned into an
+        # edge — so every VL scanned as zero-inbound and false-flagged dead.
+        # Emitting it here makes "which layout uses this VL" a real, precise
+        # (collision-free) structural reference.
+        if "valueList" in obj and isinstance(obj["valueList"], str) and obj["valueList"]:
+            refs.append(XRef(
+                "layout", source_name, "value list (field format)",
+                "value_list", obj["valueList"], "",
+            ))
+
         # Script reference (button action or script trigger). Trigger dicts
         # carry an "event" key (OnObjectSave, OnLayoutKeystroke, …); buttons do
         # not. A trigger is a live caller — recording it stops trigger-only
@@ -1618,6 +1630,49 @@ def _enrich_candidate(name, bucket, obj_type, corpus, dyn_flags,
     }
 
 
+# Source-type → removal-candidate set key, for referrer-liveness lookups. Types
+# absent here (e.g. "relationship") are treated as LIVE referrers — conservative,
+# so we never call an object transitively dead on an uncertain referrer.
+_SRC_TO_DEAD_KEY = {
+    "layout": "layouts", "script": "scripts", "value_list": "value_lists",
+    "custom_func": "custom_functions", "field_calc": "fields", "field_auto": "fields",
+}
+
+
+def find_weak_rescues(obj_type, all_objects, candidate_set, excluded,
+                      xrefs, dead_sets):
+    """Objects kept alive ONLY by referrers that are themselves removal candidates.
+
+    A "true but misleading" rescue: the object has inbound references (so it is
+    NOT a zero-inbound dead candidate), but every referrer is itself dead/held —
+    making the object transitively dead. The engine does not propagate deadness,
+    so these never reach the candidate table; this surfaces them for review,
+    never auto-judging. Scoped to fields / value_lists / layouts (the schema
+    types whose referrers carry precise structural edges). A referrer of unknown
+    type (relationship, etc.) counts as LIVE, so we only flag when EVERY referrer
+    is a confirmed removal candidate. Returns {name: [referrer_label, ...]}.
+    """
+    if obj_type not in ("fields", "value_lists", "layouts"):
+        return {}
+    ref_type = _dead_ref_type(obj_type)
+    referrers = {}  # name -> list of (is_dead, label)
+    for ref in xrefs:
+        if ref.ref_type != ref_type or ref.ref_name not in all_objects:
+            continue
+        name = ref.ref_name
+        if name in candidate_set or name in excluded:
+            continue  # already a candidate / heuristically excluded
+        deadkey = _SRC_TO_DEAD_KEY.get(ref.source_type)
+        referrer_name = ref.source_name.split(" (ID")[0]
+        is_dead = deadkey is not None and referrer_name in dead_sets.get(deadkey, set())
+        referrers.setdefault(name, []).append((is_dead, referrer_name))
+    weak = {}
+    for name, refs in referrers.items():
+        if refs and all(is_dead for is_dead, _ in refs):
+            weak[name] = sorted({label for _d, label in refs})
+    return weak
+
+
 def cmd_confirm(solution_name, obj_type, as_json, verbose, canvas_strict):
     """Enrich dead candidates with batched deterministic judgment signals."""
     solution_dir = CONTEXT_DIR / solution_name
@@ -1682,6 +1737,12 @@ def cmd_confirm(solution_name, obj_type, as_json, verbose, canvas_strict):
     for row in enriched:
         tally[row["disposition"]] = tally.get(row["disposition"], 0) + 1
 
+    # Transitively-dead surface (additive, informational): objects not in the
+    # candidate set but kept alive ONLY by referrers that are themselves dead.
+    excluded = set(res.system_excluded) | set(res.module_objects)
+    weak_rescues = find_weak_rescues(
+        obj_type, res.all_objects, dead_sets[obj_type], excluded, res.xrefs, dead_sets)
+
     heuristic_notes = [
         "likely-live = referenced (calc/caller) by an object that is itself LIVE (not a removal "
         "candidate) — keep at a glance, no source-open needed. review is reserved for the genuinely "
@@ -1708,15 +1769,17 @@ def cmd_confirm(solution_name, obj_type, as_json, verbose, canvas_strict):
             "heuristic_notes": heuristic_notes,
             "candidates": enriched,
             "tally": tally,
+            "weak_rescues": weak_rescues,
         }, indent=2, ensure_ascii=False))
         return
 
     _render_confirm_table(solution_name, obj_type, res, enriched, tally,
-                          dyn_flags, heuristic_notes, canvas_strict)
+                          dyn_flags, heuristic_notes, canvas_strict, weak_rescues)
 
 
 def _render_confirm_table(solution_name, obj_type, res, enriched, tally,
-                          dyn_flags, heuristic_notes, canvas_strict):
+                          dyn_flags, heuristic_notes, canvas_strict,
+                          weak_rescues=None):
     """Print the one-read enriched candidate table."""
     print(f"=== Dead-object confirmation: {obj_type} ({solution_name}) ===")
     strict = "ON" if canvas_strict else "OFF (informational)"
@@ -1778,6 +1841,17 @@ def _render_confirm_table(solution_name, obj_type, res, enriched, tally,
 
     print(f"\nDisposition tally: {tally['likely-dead']} likely-dead, "
           f"{tally['review']} review, {tally['likely-live']} likely-live")
+
+    if weak_rescues:
+        print(f"\nWEAK RESCUES ({len(weak_rescues)}) — NOT a dead candidate (has inbound refs), but "
+              "every referrer is ITSELF a dead candidate.")
+        print("Transitively dead: the rescue is real yet the referrer is going away. Verify, "
+              "don't auto-delete.")
+        for name in sorted(weak_rescues):
+            refs = weak_rescues[name]
+            shown = ", ".join(refs[:3]) + (f" +{len(refs) - 3}" if len(refs) > 3 else "")
+            print(f"  {name[:48]}  ← dead referrer(s): {shown}")
+
     print("CONSERVATIVE — verify before deleting. Notes:")
     for n in heuristic_notes:
         print(f"  • {n}")
