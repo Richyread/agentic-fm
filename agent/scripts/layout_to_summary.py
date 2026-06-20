@@ -509,6 +509,38 @@ def parse_action_script(el):
     return result[0] if result else None
 
 
+def parse_action_nav_layouts(el):
+    """Layout(s) a button action navigates to (New Window / Go to Layout / GTRR).
+
+    A button whose <action> runs a navigation step carries its destination as a
+    <LayoutReference> nested inside the step's parameters — e.g. New Window stores
+    it under WindowReference → LayoutReferenceContainer → LayoutReference. Unlike
+    a script step (whose target the script parser already captures via the HR
+    `Layout: "X"`), an inline button action never reaches the script corpus, so a
+    layout opened ONLY via a card-window / nav button scans zero-inbound and
+    false-flags as dead. parse_action_script only looks for a direct
+    <ScriptReference>, so it misses these. Walks this element's own subtree,
+    stopping at nested LayoutObject boundaries so it never steals a child object's
+    action. Returns a sorted list of destination layout names, or None.
+    """
+    names = []
+
+    def _find(node):
+        for child in node:
+            if child.tag == "LayoutObject":
+                continue  # belongs to a nested object — parsed separately
+            if child.tag == "action":
+                for lr in child.iter("LayoutReference"):
+                    name = lr.get("name", "")
+                    if name and name != "<original layout>" and name not in names:
+                        names.append(name)
+            else:
+                _find(child)
+
+    _find(el)
+    return sorted(names) if names else None
+
+
 def collect_child_objects(el):
     """Nested LayoutObjects belonging directly to this object.
 
@@ -608,6 +640,12 @@ def parse_layout_object(obj_el):
         action_script = parse_action_script(obj_el)
         if action_script:
             summary.update(action_script)
+
+    # Button-action navigation targets (New Window / Go to Layout / GTRR layout).
+    # Independent of the script above — a nav button has no ScriptReference.
+    nav_layouts = parse_action_nav_layouts(obj_el)
+    if nav_layouts:
+        summary["navLayouts"] = nav_layouts
 
     # Object-level script triggers (OnObjectEnter, OnObjectSave, …)
     triggers = parse_triggers(obj_el)
