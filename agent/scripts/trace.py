@@ -541,6 +541,23 @@ def _walk_layout_json(obj, source_name, to_map, refs):
                 "value_list", obj["valueList"], "",
             ))
 
+        # Button-action navigation targets (New Window / Go to Layout / GTRR).
+        # A layout opened ONLY via a card-window or nav button (inline action,
+        # no script) would otherwise scan zero-inbound and false-flag as dead.
+        nav = obj.get("navLayouts")
+        if isinstance(nav, list):
+            self_layout = source_name.split(" (ID")[0]
+            for layout_name in nav:
+                # Skip a self-target: a button that opens its own layout doesn't
+                # make that layout reachable from elsewhere, so it must not rescue
+                # it from a dead verdict (mirrors the script parser's self-test).
+                if (isinstance(layout_name, str) and layout_name
+                        and layout_name != self_layout):
+                    refs.append(XRef(
+                        "layout", source_name, "button nav (New Window / Go to Layout)",
+                        "layout", layout_name, "",
+                    ))
+
         # Script reference (button action or script trigger). Trigger dicts
         # carry an "event" key (OnObjectSave, OnLayoutKeystroke, …); buttons do
         # not. A trigger is a live caller — recording it stops trigger-only
